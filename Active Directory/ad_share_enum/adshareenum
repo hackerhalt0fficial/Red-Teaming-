@@ -1,0 +1,146 @@
+#!/bin/bash
+figlet "ADShareEnum" | lolcat
+
+
+
+# Default values (empty)
+domainname=""
+dcip=""
+username=""
+password=""
+
+# Function to show usage
+usage() {
+    echo "Usage: $0 [-d DOMAIN] [-i DC_IP] [-u USERNAME] [-p PASSWORD]"
+    echo "If arguments are not provided, you will be prompted to enter them."
+    exit 1
+}
+
+# Parse command-line arguments
+while getopts "d:i:u:p:h" opt; do
+    case $opt in
+        d) domainname=$OPTARG ;;
+        i) dcip=$OPTARG ;;
+        u) username=$OPTARG ;;
+        p) password=$OPTARG ;;
+        h) usage ;; # Display help and exit
+        *) usage ;; # Display usage for any invalid option
+    esac
+done
+
+# Start authentication loop
+while true; do
+    # Prompt for missing inputs
+    if [[ -z "$domainname" ]]; then
+        read -p "Enter the domain name: " domainname
+    fi
+    if [[ -z "$dcip" ]]; then
+        read -p "Enter the DC IP: " dcip
+    fi
+    if [[ -z "$username" ]]; then
+        read -p "Enter domain username: " username
+    fi
+    if [[ -z "$password" ]]; then
+        read -s -p "Enter domain password: " password
+    fi
+
+    rm *.ccache 2> /dev/null
+
+    # Attempt to authenticate and capture output
+    output=$(/root/.local/bin/getTGT.py $domainname/$username:$password -dc-ip $dcip)
+
+    # Check if "Saving ticket" is in the output
+    if echo "$output" | grep -q "Saving ticket"; then
+        echo -e "\e[32m[+]Authentication successful\e[0m"  # Green text
+        break  # Exit loop if authentication is successful
+    else
+        echo ""
+        echo -e "\e[31mAuthentication failed. Please try again.\e[0m"  # Red text
+        unset domainname
+        unset dcip
+        unset username
+        unset password
+    fi
+done
+
+echo
+
+# Function to show progress bar
+show_progress() {
+    while kill -0 "$1" 2>/dev/null; do
+        echo -n "."
+        sleep 0.5  # Adjust the speed as needed
+    done
+    echo -e "\e[32m[+]Done\e[0m" 
+}
+
+echo -e "\e[32mRunning script with user $username ...\e[0m"  # Green text
+
+export KRB5CCNAME=$(ls *.ccache)
+
+echo -e "\e[33mGetting the list of computers...\e[0m" 
+
+authmode='kerberos'
+
+output_kerb=$(/root/.local/bin/GetADUsers.py $domainname/$username -k -no-pass -dc-ip $dcip -user $username 2>&1)
+output_pass=$(/root/.local/bin/GetADUsers.py $domainname/$username:$password -dc-ip $dcip -user $username 2>&1)
+
+
+
+if [[ ! $( echo "$output_kerb" | grep -q "$username")  ]]; then
+   if [[ ! $( echo "$output_pass" | grep -q "$username")  ]]; then
+        authmode='pass';
+   fi
+fi
+
+
+if [ "$authmode" = "kerberos" ]; then
+    /root/.local/bin/GetADComputers.py $domainname/$username -k -no-pass -dc-ip $dcip  > /tmp/computers &
+else
+    /root/.local/bin/GetADComputers.py $domainname/$username:$password -dc-ip $dcip  > /tmp/computers &
+fi
+
+
+# Get the PID of the command
+pid=$!
+
+# Show the progress bar
+show_progress "$pid"
+
+cat /tmp/computers | awk '{print $2}' | sort -u  > /tmp/computers.txt
+#rm  /tmp/computers
+rm /tmp/computers_chunk_* 2> /dev/null
+
+sleep 10
+echo -e "\e[33mGetting the list of READ and WRITE shares ...\e[0m" 
+
+
+split -l 60 /tmp/computers.txt /tmp/computers_chunk_
+
+    for computer_file in $(ls /tmp/computers_chunk_*);
+    do
+    if [ "$authmode" = "kerberos" ]; then
+        /root/.local/bin/netexec smb $computer_file -u $username --smb-timeout 10 --dns-timeout 10 --use-kcache --shares --filter-shares READ WRITE  2> /dev/null| tee --append /tmp/shares.txt ;
+        # sleep 1;
+    else
+        /root/.local/bin/netexec smb $computer_file -u $username  -p $password --smb-timeout 10 --dns-timeout 10 --shares --filter-shares READ WRITE  2> /dev/null| tee --append /tmp/shares.txt ;
+        # sleep 1;
+    fi
+
+    done &
+# Get the PID of the command
+pid=$!
+
+# Show the progress bar
+show_progress "$pid"
+
+echo -e "\e[32m[+]Done\e[0m" 
+
+cat /tmp/shares.txt |  egrep -E "READ|WRITE" | awk '$5 != "IPC$" && $5 != "print$" && $5 != "NETLOGON"  && $5 != "SYSVOL" {$1=""; $3="";  print $0}' > "/output/share_scan_result_$username.txt"
+#rm /tmp/shares.txt
+# Save output to a text file
+
+echo -e "\e[34mFile ready, open your browser to get it !\e[0m" 
+# Start a Python HTTP server to serve the output file
+cd /output
+python3 -m http.server 7070
